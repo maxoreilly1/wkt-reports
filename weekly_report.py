@@ -317,7 +317,7 @@ def fetch_leads(today):
                 cache["leads"][m["id"]] = lead
                 new += 1
         url, params = data.get("@odata.nextLink"), None
-    cache["last_fetch"] = datetime.utcnow().isoformat(timespec="seconds")
+    cache["last_fetch"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
     with open(LEADS_CACHE, "w") as f:
         json.dump(cache, f)
     print(f"  scanned {scanned} emails, {new} new lead emails, {len(cache['leads'])} cached in total")
@@ -635,6 +635,29 @@ actively-scheduled job dated no earlier than 30 days before due.</p>
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{CSS}</style></head><body>{body}</body></html>"
 
 
+# ── Save to OneDrive ─────────────────────────────────────────────────────────
+def save_to_onedrive(pdf_path):
+    """Upload the PDF to the mailbox owner's OneDrive, folder 'WKT Reports'. Needs the app
+    permission Files.ReadWrite.All (Application) with admin consent."""
+    user = os.getenv("ONEDRIVE_USER") or os.getenv("LEADS_MAILBOX", "admin@wekilltermites.com.au")
+    folder = os.getenv("ONEDRIVE_FOLDER", "WKT Reports")
+    name = os.path.basename(pdf_path)
+    try:
+        with open(pdf_path, "rb") as f:
+            r = requests.put(f"{GRAPH_BASE}/users/{user}/drive/root:/{folder}/{name}:/content",
+                             headers={"Authorization": f"Bearer {graph_token()}",
+                                      "Content-Type": "application/pdf"}, data=f.read(), timeout=120)
+        if r.status_code in (200, 201):
+            print(f"Saved to OneDrive ({user}): {folder}/{name}")
+            print(f"  Open: {r.json().get('webUrl', '')}")
+        else:
+            print(f"OneDrive upload failed ({r.status_code}): {r.text[:200]}")
+            if r.status_code in (401, 403):
+                print("  -> add Files.ReadWrite.All (Application) to the Azure app and grant admin consent")
+    except Exception as e:                                       # noqa: BLE001
+        print(f"OneDrive upload failed: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def build_report(sm8, leads, inp, today):
     gm = inp["gross_margin"]
@@ -667,13 +690,41 @@ def build_report(sm8, leads, inp, today):
     return build_html(today, ch_rows, util_retro, util_pro, ret, ret_last, gm, notes), ch_rows, util_retro, util_pro, ret, ret_last
 
 
+def check_leads(sm8, leads, today):
+    """Print a sample of recent Facebook leads that didn't book, to see why."""
+    idx = contact_index(sm8)
+    jobs = defaultdict(list)
+    for j in sm8["job"]:
+        if j.get("company_uuid"):
+            jobs[j["company_uuid"]].append(j)
+    eps = attach_bookings(build_episodes(leads), idx, booked_jobs_by_company(sm8["job"]))
+    recent = [e for e in eps if e["channel"] == "Facebook" and e["start"] >= today - timedelta(days=60)
+              and not e["booked"]]
+    unmatched = [e for e in recent if not e["matched"]]
+    matched = [e for e in recent if e["matched"]]
+    print(f"\nFacebook leads last 60 days, not booked: {len(recent)} "
+          f"({len(unmatched)} no ServiceM8 match, {len(matched)} matched but no qualifying job)")
+    print("\nSample with NO match (search one of these in ServiceM8 by hand):")
+    for e in unmatched[:8]:
+        print(f"  {e['start']}  {', '.join(k[2:] for k in sorted(e['keys'])) or '(no phone/email in email)'}")
+    print("\nSample MATCHED but not counted as booked (their jobs: date / status):")
+    for e in matched[:8]:
+        cos = set().union(*(idx.get(k, set()) for k in e["keys"]))
+        js = sorted((j.get("date") or "")[:10] + " " + (j.get("status") or "") for cu in cos for j in jobs[cu])
+        print(f"  lead {e['start']}: " + ("; ".join(js[-4:]) or "no jobs"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-prompt", action="store_true", help="reuse last answers")
+    ap.add_argument("--check-leads", action="store_true", help="show why Facebook leads aren't matching")
     args = ap.parse_args()
     today = date.today()
 
     sm8 = fetch_sm8()
+    if args.check_leads:
+        check_leads(sm8, fetch_leads(today), today)
+        return
     inp = load_inputs()
     if not args.no_prompt:
         inp = prompt_inputs(inp, sorted({staff_name(s) for s in sm8["staff"] if is_active(s) and staff_name(s)}))
@@ -689,6 +740,7 @@ def main():
         s = ch_rows[ch][-1][1]
         print(f"  {ch:9} last 4 wks: {s['leads']} leads, {s['booked']} booked, throughput {s['thru']:.2f}, "
               f"CAC {money(s['cac']) if s['cac'] else '-'}, avg sale {money(s['asp'])}, GP:CAC {fmt_ratio(s['ratio'])}")
+        print(f"            {s['unmatched']} of {s['leads']} leads had no phone/email matching any ServiceM8 customer")
     print(f"  Utilisation last week {ur['pct']:.0f}%, next 10 working days {up['pct']:.0f}%")
     if ret["settled"]:
         print(f"  Retention settled {ret['settled'][-1][0]}: {ret['settled'][-1][1]:.1f}%")
@@ -698,6 +750,7 @@ def main():
     os.makedirs(os.path.dirname(out), exist_ok=True)
     HTML(string=page).write_pdf(out)
     print(f"\nPDF saved: {out}")
+    save_to_onedrive(out)
 
 
 if __name__ == "__main__":

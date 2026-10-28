@@ -53,7 +53,7 @@ except ImportError:
 HERE        = os.path.dirname(os.path.abspath(__file__))
 INPUTS_FILE = os.path.join(HERE, "report_inputs.json")
 LEADS_CACHE = os.path.join(HERE, "leads_cache.json")
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEFAULT_TECHS           = ["Max Horvath", "Sam Dickinson", "Greg Edwards",
@@ -337,9 +337,8 @@ def fetch_leads(today):
         data = r.json()
         for m in data.get("value", []):
             scanned += 1
-            sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
-            if sender == mailbox.lower():
-                continue                                # our own sent replies
+            if re.match(r"\s*(re|fw|fwd)\s*:", m.get("subject") or "", re.I):
+                continue                                # replies / forwards, not new leads
             lead = parse_lead_email(m.get("subject") or "", (m.get("body") or {}).get("content") or "",
                                     m["receivedDateTime"])
             if lead and m["id"] not in cache["leads"]:

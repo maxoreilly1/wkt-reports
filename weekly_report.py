@@ -430,7 +430,10 @@ def attach_bookings(eps, idx, jobs_by_co):
         in30 = [j for j in jobs if j[0] <= hi30]
         ep["matched"]     = bool(cos)
         ep["booked"]      = bool(in30)
-        ep["first_value"] = in30[0][1] if in30 else None
+        paid = [j for j in in30 if j[1] > 0]               # skip $0 quotes / free inspections
+        ep["first_value"] = paid[0][1] if paid else None
+        ep["first_job"]   = paid[0][2] if paid else None
+        ep["companies"]   = cos
         ep["six_month"]   = sum(j[1] for j in jobs) if jobs else None
     return eps
 
@@ -441,7 +444,7 @@ def channel_stats(eps, channel, frm, to, cpl, gm):
     booked = sum(1 for e in pool if e["booked"])
     thru   = booked / leads if leads else 0.0
     if channel == "Facebook":
-        vals = [e["first_value"] for e in pool if e["booked"]]
+        vals = [e["first_value"] for e in pool if e["booked"] and e["first_value"] is not None]
     else:
         vals = [e["six_month"] for e in pool if e["six_month"] is not None]
     asp  = sum(vals) / len(vals) if vals else 0.0
@@ -815,16 +818,44 @@ def check_leads(sm8, leads, today):
         print(f"  lead {e['start']}: " + ("; ".join(js[-4:]) or "no jobs"))
 
 
+def check_sales(sm8, leads, today):
+    """List every booked Facebook lead in the last 6 weeks with the job used for its sale price."""
+    idx = contact_index(sm8)
+    eps = attach_bookings(build_episodes(leads), idx, booked_jobs_by_company(sm8["job"], sm8["jobactivity"]))
+    job = {j.get("uuid"): j for j in sm8["job"]}
+    njobs = defaultdict(int)
+    for j in sm8["job"]:
+        njobs[j.get("company_uuid")] += 1
+    this_monday = today - timedelta(days=today.weekday())
+    for i in range(6, 0, -1):
+        ws = this_monday - timedelta(days=7 * i)
+        pool = [e for e in eps if e["channel"] == "Facebook" and ws <= e["start"] <= ws + timedelta(days=6)
+                and e["booked"]]
+        vals = [e["first_value"] for e in pool if e["first_value"] is not None]
+        print(f"\nWeek {ws:%d %b}: {len(pool)} booked, avg first paid job "
+              f"{money(sum(vals) / len(vals)) if vals else '-'}")
+        for e in pool:
+            j = job.get(e["first_job"]) or {}
+            print(f"  lead {e['start']}  job {(j.get('date') or '')[:10]}  "
+                  f"{money(e['first_value']) if e['first_value'] is not None else 'only $0 jobs':>12}  "
+                  f"#{j.get('generated_job_id', '')}  {(j.get('job_description') or '')[:45]!r}  "
+                  f"[{len(e['companies'])} client(s), {sum(njobs[c] for c in e['companies'])} jobs on file]")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-prompt", action="store_true", help="reuse last answers")
     ap.add_argument("--check-leads", action="store_true", help="show why Facebook leads aren't matching")
+    ap.add_argument("--check-sales", action="store_true", help="list the job behind each Facebook sale price")
     args = ap.parse_args()
     today = date.today()
 
     sm8 = fetch_sm8()
     if args.check_leads:
         check_leads(sm8, fetch_leads(today), today)
+        return
+    if args.check_sales:
+        check_sales(sm8, fetch_leads(today), today)
         return
     inp = load_inputs()
     if not args.no_prompt:

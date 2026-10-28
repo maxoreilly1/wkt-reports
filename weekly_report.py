@@ -53,6 +53,7 @@ except ImportError:
 HERE        = os.path.dirname(os.path.abspath(__file__))
 INPUTS_FILE = os.path.join(HERE, "report_inputs.json")
 LEADS_CACHE = os.path.join(HERE, "leads_cache.json")
+CACHE_VERSION = 2
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 DEFAULT_TECHS           = ["Max Horvath", "Sam Dickinson", "Greg Edwards",
@@ -67,6 +68,7 @@ DEDUPE_DAYS             = 30
 GOOGLE_CATCHMENT_MONTHS = 6
 LEAD_LOOKBACK_DAYS      = 240      # first run: how far back to read the inbox
 WEEKS_SHOWN             = 6
+MONTHS_SHOWN            = 6
 POOLED_WEEKS            = 4
 RETENTION_START         = (2024, 11)
 RETENTION_GRACE_BEFORE  = 30
@@ -151,10 +153,26 @@ def _split_names(raw):
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
-def prompt_inputs(inp, staff_names):
-    print("\n--- This week's inputs ---")
-    inp["fb_cpl"]       = _ask_number("Facebook CPL", inp.get("fb_cpl"))
-    inp["google_cpl"]   = _ask_number("Google CPL", inp.get("google_cpl"))
+def last_complete_month(today):
+    end = today.replace(day=1) - timedelta(days=1)
+    return end.replace(day=1), end
+
+
+def prompt_inputs(inp, staff_names, today):
+    last_mon = today - timedelta(days=today.weekday() + 7)
+    print(f"\n--- Inputs ---")
+    print(f"Last week ({last_mon:%d %b} - {last_mon + timedelta(days=6):%d %b}):")
+    inp["fb_cpl"]       = _ask_number("  Facebook CPL", inp.get("fb_cpl"))
+    inp["google_cpl"]   = _ask_number("  Google CPL", inp.get("google_cpl"))
+    inp.setdefault("cpl_history", {})[last_mon.isoformat()] = {"fb_cpl": inp["fb_cpl"],
+                                                               "google_cpl": inp["google_cpl"]}
+    ms, _ = last_complete_month(today)
+    mk = ms.strftime("%Y-%m")
+    monthly = inp.setdefault("monthly_cpl", {})
+    prev = monthly.get(mk) or {}
+    print(f"Last month ({ms:%B %Y}):")
+    monthly[mk] = {"fb_cpl": _ask_number("  Facebook CPL", prev.get("fb_cpl", inp["fb_cpl"])),
+                   "google_cpl": _ask_number("  Google CPL", prev.get("google_cpl", inp["google_cpl"]))}
     inp["gross_margin"] = _ask_number("Gross margin (e.g. 0.5)", inp.get("gross_margin"), is_margin=True)
 
     techs = inp.get("techs") or list(DEFAULT_TECHS)
@@ -242,12 +260,14 @@ OWN_EMAIL_HINTS = ("wekilltermite", "unbounce", "facebook", "servicem8", "google
 
 
 def classify_lead(subject, body):
+    """Only real lead notifications. A bare mention of 'facebook' (e.g. an email signature or a
+    Meta billing email) is NOT a lead."""
     t = f"{subject}\n{body}".lower()
-    if "unbounce" in t or "gclid" in t:
-        return "Google"
     if "submitted your form" in t:
         return "Organic"
-    if "facebook" in t:
+    if "unbounce" in t and ("gclid" in t or "new lead has been captured" in t):
+        return "Google"
+    if "facebook lead" in t:
         return "Facebook"
     return None
 
@@ -268,10 +288,12 @@ def parse_lead_email(subject, body, received_iso):
     if not ch:
         return None
     phones, emails = extract_contacts(body)
+    if not phones and not emails:
+        return None                                    # can't be a usable lead without contact details
     rec = datetime.fromisoformat(received_iso.replace("Z", "+00:00"))
     local = rec.astimezone(timezone(timedelta(hours=10)))          # Brisbane, no DST
     return {"channel": ch, "received": local.date().isoformat(),
-            "phones": sorted(phones), "emails": sorted(emails)}
+            "phones": sorted(phones), "emails": sorted(emails), "subject": subject[:80]}
 
 
 def graph_token():
@@ -286,10 +308,14 @@ def graph_token():
 
 def fetch_leads(today):
     """Read new emails since the last run, keep only lead emails, cache them locally."""
-    cache = {"last_fetch": None, "leads": {}}
+    cache = {"version": CACHE_VERSION, "last_fetch": None, "leads": {}}
     if os.path.exists(LEADS_CACHE):
         with open(LEADS_CACHE) as f:
-            cache = json.load(f)
+            old = json.load(f)
+        if old.get("version") == CACHE_VERSION:
+            cache = old
+        else:
+            print("Lead rules changed - re-reading the whole inbox once")
     if cache.get("last_fetch"):
         since = datetime.fromisoformat(cache["last_fetch"]) - timedelta(days=1)
     else:
@@ -302,7 +328,7 @@ def fetch_leads(today):
                "Prefer": 'outlook.body-content-type="text"'}
     url = f"{GRAPH_BASE}/users/{mailbox}/messages"
     params = {"$filter": f"receivedDateTime ge {since_iso}",
-              "$select": "id,subject,receivedDateTime,body",
+              "$select": "id,subject,receivedDateTime,body,from",
               "$orderby": "receivedDateTime asc", "$top": "100"}
     scanned = new = 0
     while url:
@@ -311,6 +337,9 @@ def fetch_leads(today):
         data = r.json()
         for m in data.get("value", []):
             scanned += 1
+            sender = (((m.get("from") or {}).get("emailAddress") or {}).get("address") or "").lower()
+            if sender == mailbox.lower():
+                continue                                # our own sent replies
             lead = parse_lead_email(m.get("subject") or "", (m.get("body") or {}).get("content") or "",
                                     m["receivedDateTime"])
             if lead and m["id"] not in cache["leads"]:
@@ -598,8 +627,8 @@ def fmt_ratio(v):
     return f"{v:.1f} : 1" if v is not None else "n/a"
 
 
-def channel_table(name, rows):
-    h = ("<table><tr><th>Week</th><th>Leads</th><th>Booked</th><th>Throughput</th><th>CPL</th>"
+def channel_table(name, rows, period="Week"):
+    h = (f"<table><tr><th>{period}</th><th>Leads</th><th>Booked</th><th>Throughput</th><th>CPL</th>"
          "<th>CAC</th><th>Avg sale</th><th>GP</th><th>GP:CAC</th></tr>")
     for label, s, pool in rows:
         h += (f"<tr class='{'pool' if pool else ''}'><td>{label}</td><td>{s['leads']}</td><td>{s['booked']}</td>"
@@ -657,9 +686,11 @@ def build_html(today, ch_rows, util_retro, util_pro, ret, ret_last, gm, notes):
 <div class='sub'>Generated {today:%d %B %Y} &middot; gross margin {gm:.0%}</div>
 {top}
 <h2>GP:CAC by channel</h2>
-{channel_table('Facebook', ch_rows['Facebook'])}
+{channel_table('Facebook - by week', ch_rows['Facebook'])}
+{channel_table('Facebook - by month', ch_rows['Facebook_m'], 'Month')}
 <p class='note'>GP = average value of the first booked job &times; gross margin. CAC = CPL &divide; throughput.</p>
-{channel_table('Google', ch_rows['Google'])}
+{channel_table('Google - by week', ch_rows['Google'])}
+{channel_table('Google - by month', ch_rows['Google_m'], 'Month')}
 <p class='note'>GP = average 6-month sum of booked job value from the lead &times; gross margin. Recent weeks
 are understated until their 6-month window fills in, so compare older weeks with care.</p>
 <p class='note'>Leads come from the leads inbox (repeat enquiries within 30 days merged, first channel gets
@@ -729,6 +760,14 @@ def build_report(sm8, leads, inp, today):
         pool_from = weeks[-POOLED_WEEKS][0]
         rows.append((f"Last {POOLED_WEEKS} weeks", channel_stats(eps, ch, pool_from, weeks[-1][1], inp[key], gm), True))
         ch_rows[ch] = rows
+        mrows = []
+        ms, _ = last_complete_month(today)
+        for i in range(MONTHS_SHOWN - 1, -1, -1):
+            a = add_months(ms, -i)
+            b = add_months(a, 1) - timedelta(days=1)
+            cpl = inp.get("monthly_cpl", {}).get(a.strftime("%Y-%m"), {}).get(key)
+            mrows.append((f"{a:%b %Y}", channel_stats(eps, ch, a, b, cpl, gm), False))
+        ch_rows[ch + "_m"] = mrows
 
     techs = resolve_techs(inp["techs"], sm8["staff"])
     last_mon = this_monday - timedelta(days=7)
@@ -751,6 +790,16 @@ def check_leads(sm8, leads, today):
         if j.get("company_uuid"):
             jobs[j["company_uuid"]].append(j)
     eps = attach_bookings(build_episodes(leads), idx, booked_jobs_by_company(sm8["job"], sm8["jobactivity"]))
+    from collections import Counter
+    fb60 = [L for L in leads if L["channel"] == "Facebook"
+            and date.fromisoformat(L["received"]) >= today - timedelta(days=60)]
+    print(f"\nFacebook lead emails, last 60 days: {len(fb60)}. Most common subjects:")
+    for subj, n in Counter(L.get("subject", "") for L in fb60).most_common(8):
+        print(f"  {n:5}  {subj}")
+    ep60 = [e for e in eps if e["channel"] == "Facebook" and e["start"] >= today - timedelta(days=60)]
+    m60 = [e for e in ep60 if e["matched"]]
+    print(f"After merging repeats: {len(ep60)} leads; {len(m60)} match a ServiceM8 customer; "
+          f"{sum(e['booked'] for e in ep60)} booked within 30 days")
     recent = [e for e in eps if e["channel"] == "Facebook" and e["start"] >= today - timedelta(days=60)
               and not e["booked"]]
     unmatched = [e for e in recent if not e["matched"]]
@@ -780,9 +829,8 @@ def main():
         return
     inp = load_inputs()
     if not args.no_prompt:
-        inp = prompt_inputs(inp, sorted({staff_name(s) for s in sm8["staff"] if is_active(s) and staff_name(s)}))
-    last_week = (today - timedelta(days=today.weekday() + 7)).isoformat()
-    inp.setdefault("cpl_history", {})[last_week] = {"fb_cpl": inp["fb_cpl"], "google_cpl": inp["google_cpl"]}
+        inp = prompt_inputs(inp, sorted({staff_name(s) for s in sm8["staff"] if is_active(s) and staff_name(s)}),
+                            today)
     save_inputs(inp)
 
     leads = fetch_leads(today)

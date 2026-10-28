@@ -23,8 +23,8 @@ Booked      the person (matched by phone or email to a ServiceM8 customer) has a
             of the lead (1 day grace before).
 Throughput  booked / leads, as a decimal.
 CAC         CPL / throughput.
-GP (FB)     average value of the FIRST booked job x gross margin.
-GP (Google) average 6-month sum of booked job value from the lead x gross margin (old method).
+GP (FB)     average value of the first earned sale (scheduled Work Order or Completed job) x margin.
+GP (Google) average 6-month sum of earned sales from the lead x gross margin.
 GP:CAC      GP / CAC.
 Utilisation booked hours / (techs x 8h x working days). Booked hours = each tech's scheduled job time,
             plus gaps between jobs of <= 1h (drive time). Can exceed 100%.
@@ -412,7 +412,9 @@ def booked_jobs_by_company(jobs, activities):
             continue
         d = parse_date(j.get("date"))
         if d and j.get("company_uuid"):
-            out[j["company_uuid"]].append((d, float(j.get("total_invoice_amount") or 0), j.get("uuid")))
+            st = (j.get("status") or "").lower()
+            earned = st == "completed" or (st == "work order" and j.get("uuid") in on_cal)
+            out[j["company_uuid"]].append((d, float(j.get("total_invoice_amount") or 0), j.get("uuid"), earned))
     for cu in out:
         out[cu].sort()
     return out
@@ -430,11 +432,13 @@ def attach_bookings(eps, idx, jobs_by_co):
         in30 = [j for j in jobs if j[0] <= hi30]
         ep["matched"]     = bool(cos)
         ep["booked"]      = bool(in30)
-        paid = [j for j in in30 if j[1] > 0]               # skip $0 quotes / free inspections
+        # Earned sale = scheduled AND Work Order/Completed (a scheduled quote is booked, not sold)
+        paid = [j for j in in30 if j[3] and j[1] > 0]
         ep["first_value"] = paid[0][1] if paid else None
         ep["first_job"]   = paid[0][2] if paid else None
         ep["companies"]   = cos
-        ep["six_month"]   = sum(j[1] for j in jobs) if jobs else None
+        earned = [j for j in jobs if j[3]]
+        ep["six_month"]   = sum(j[1] for j in earned) if earned else None
     return eps
 
 
@@ -690,10 +694,12 @@ def build_html(today, ch_rows, util_retro, util_pro, ret, ret_last, gm, notes):
 <h2>GP:CAC by channel</h2>
 {channel_table('Facebook - by week', ch_rows['Facebook'])}
 {channel_table('Facebook - by month', ch_rows['Facebook_m'], 'Month')}
-<p class='note'>GP = average value of the first booked job &times; gross margin. CAC = CPL &divide; throughput.</p>
+<p class='note'>GP = average value of the first earned sale (scheduled Work Order or Completed job, not a
+quote) &times; gross margin. CAC = CPL &divide; throughput.</p>
 {channel_table('Google - by week', ch_rows['Google'])}
 {channel_table('Google - by month', ch_rows['Google_m'], 'Month')}
-<p class='note'>GP = average 6-month sum of booked job value from the lead &times; gross margin. Recent weeks
+<p class='note'>GP = average 6-month sum of earned sales (scheduled Work Order or Completed jobs) from the lead
+&times; gross margin. Recent weeks
 are understated until their 6-month window fills in, so compare older weeks with care.</p>
 <p class='note'>Leads come from the leads inbox (repeat enquiries within 30 days merged, first channel gets
 credit). Booked = matched by phone/email to a ServiceM8 customer with a job put on the calendar (or completed)
@@ -832,12 +838,12 @@ def check_sales(sm8, leads, today):
         pool = [e for e in eps if e["channel"] == "Facebook" and ws <= e["start"] <= ws + timedelta(days=6)
                 and e["booked"]]
         vals = [e["first_value"] for e in pool if e["first_value"] is not None]
-        print(f"\nWeek {ws:%d %b}: {len(pool)} booked, avg first paid job "
+        print(f"\nWeek {ws:%d %b}: {len(pool)} booked, avg first earned sale "
               f"{money(sum(vals) / len(vals)) if vals else '-'}")
         for e in pool:
             j = job.get(e["first_job"]) or {}
             print(f"  lead {e['start']}  job {(j.get('date') or '')[:10]}  "
-                  f"{money(e['first_value']) if e['first_value'] is not None else 'only $0 jobs':>12}  "
+                  f"{money(e['first_value']) if e['first_value'] is not None else 'no sale yet':>12}  "
                   f"#{j.get('generated_job_id', '')}  {(j.get('job_description') or '')[:45]!r}  "
                   f"[{len(e['companies'])} client(s), {sum(njobs[c] for c in e['companies'])} jobs on file]")
 

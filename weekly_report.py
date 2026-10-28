@@ -18,8 +18,9 @@ Definitions
 Lead        one email in the leads inbox. Unbounce/gclid = Google, "submitted your form" = Organic,
             "Facebook" = Facebook. Same phone/email within 30 days = one lead; across channels the
             first channel to see the person gets the credit. Organic is used only for this dedupe.
-Booked      the person (matched by phone or email to a ServiceM8 customer) has a Work Order or
-            Completed job whose booking date falls within 30 days of the lead (1 day grace before).
+Booked      the person (matched by phone or email to a ServiceM8 customer) has a job on the
+            dispatch calendar (any status) or a Completed job, with a booking date within 30 days
+            of the lead (1 day grace before).
 Throughput  booked / leads, as a decimal.
 CAC         CPL / throughput.
 GP (FB)     average value of the FIRST booked job x gross margin.
@@ -27,8 +28,8 @@ GP (Google) average 6-month sum of booked job value from the lead x gross margin
 GP:CAC      GP / CAC.
 Utilisation booked hours / (techs x 8h x working days). Booked hours = each tech's scheduled job time,
             plus gaps between jobs of <= 1h (drive time). Can exceed 100%.
-Retention   due date = completion + 12 months for every customer. Returned = an actively-scheduled job
-            dated >= due - 30 days. Live = cohorts due < 3 months ago (window open). Settled = returns
+Retention   due date = completion + 12 months for every service. Retained = any job on the calendar
+            from due - 30 days, or the same service rebooked 6+ months after the last one (early return). Live = cohorts due < 3 months ago (window open). Settled = returns
             within 3 months of due, frozen. Lifetime = ever returned (settled cohorts).
 """
 
@@ -67,7 +68,6 @@ GOOGLE_CATCHMENT_MONTHS = 6
 LEAD_LOOKBACK_DAYS      = 240      # first run: how far back to read the inbox
 WEEKS_SHOWN             = 6
 POOLED_WEEKS            = 4
-BOOKED_STATUSES         = {"work order", "completed"}
 RETENTION_START         = (2024, 11)
 RETENTION_GRACE_BEFORE  = 30
 RETENTION_SETTLE_MONTHS = 3
@@ -205,7 +205,7 @@ def fetch_sm8():
     print("Fetching ServiceM8...")
     s = sm8_session()
     data = {name: sm8_get(s, f"{name}.json")
-            for name in ("job", "jobactivity", "companycontact", "jobcontact", "staff")}
+            for name in ("job", "jobactivity", "companycontact", "jobcontact", "staff", "jobmaterial")}
     for k, v in data.items():
         print(f"  {k}: {len(v)} records")
     return data
@@ -372,10 +372,15 @@ def contact_index(sm8):
     return idx
 
 
-def booked_jobs_by_company(jobs):
+def booked_jobs_by_company(jobs, activities):
+    """A job counts as booked when it is active and either has a visit on the dispatch calendar
+    (any status, so a booked inspection still sitting as a Quote counts) or is Completed."""
+    on_cal = {a.get("job_uuid") for a in activities if is_active(a) and a.get("job_uuid")}
     out = defaultdict(list)
     for j in jobs:
-        if not is_active(j) or (j.get("status") or "").lower() not in BOOKED_STATUSES:
+        if not is_active(j):
+            continue
+        if j.get("uuid") not in on_cal and (j.get("status") or "").lower() != "completed":
             continue
         d = parse_date(j.get("date"))
         if d and j.get("company_uuid"):
@@ -465,31 +470,85 @@ def utilisation(activities, days, techs):
 
 
 # ── Retention ─────────────────────────────────────────────────────────────────
-def retention_series(jobs, activities, today):
+_SVC_OTHER = ("surcharge", "cancellation fee", "key collection", "service location fee", "weekend callout",
+              "card 2%", "gst", "tax 10%", "discount", "credit", "referral", "tip")
+_SVC_TREAT = ("termite barrier", "termite management system", "termite protection", "termite bait",
+              "reticulation", "trelona", "atbs", "sentricon", "live termite", "termite part treatment",
+              "termite treatment", "termite foaming", "termidor", "chemical treated zone", "chemical barrier",
+              "termite monitoring", "dry wood termite")
+_SVC_INSPECT = ("termite inspection", "termite check", "timber pest inspection", "timber pest",
+                "visual pest inspection")
+_SVC_PEST = ("pest control", "general pest", "premium pest", "rodent", "cockroach", "german", "flea",
+             "spider", "ant treatment", "wasp", "silverfish", "pest treatment")
+
+
+def job_services(job, items):
+    """Service categories on a job: PC (pest control), TI (termite inspection), TT (termite
+    treatment). A job with none of them is 'OT' (other)."""
+    cats = set()
+    for text in [job.get("job_description") or ""] + list(items):
+        n = re.sub(r"\s+", " ", text.lower())
+        if not n or any(k in n for k in _SVC_OTHER):
+            continue
+        if any(k in n for k in _SVC_TREAT):
+            cats.add("TT")
+        if any(k in n for k in _SVC_INSPECT):
+            cats.add("TI")
+        if any(k in n for k in _SVC_PEST):
+            cats.add("PC")
+    return cats or {"OT"}
+
+
+def retention_series(jobs, activities, materials, today):
+    """Cohort = month a customer's service fell due (completion + 12 months, every service).
+    Retained if, for that due date D from a service on date d:
+      - ANY job (any service) is put on the calendar between D - 30 days and D + 3 months
+        (settled; lifetime has no upper bound), or
+      - an early return: a job for the SAME service put on the calendar between d + 6 months and
+        D - 30 days.
+    A same-service job completed within 6 months of the previous one is a follow-up visit, not a
+    new cycle, so it doesn't create its own due date."""
+    items = defaultdict(list)
+    for m in materials:
+        if m.get("job_uuid") and is_active(m):
+            items[m["job_uuid"]].append(m.get("name") or "")
     on_cal = {a.get("job_uuid") for a in activities if is_active(a) and a.get("job_uuid")}
-    sched = defaultdict(list)                       # customer -> actively-scheduled job dates
-    by_client = defaultdict(list)                   # customer -> completion dates
+    sched = defaultdict(list)                       # customer -> [(booking date, services)]
+    done = defaultdict(list)                        # customer -> [(completion date, services)]
     for j in jobs:
         cu = j.get("company_uuid")
         if not cu or not is_active(j):
             continue
+        cats = None
         if j.get("uuid") in on_cal:
             d = parse_date(j.get("date"))
             if d:
-                sched[cu].append(d)
+                cats = job_services(j, items.get(j.get("uuid"), []))
+                sched[cu].append((d, cats))
         if j.get("status") == "Completed":
             text = f"{j.get('job_description') or ''} {j.get('work_done_description') or ''}".lower()
             cd = parse_date(j.get("completion_date"))
             if cd and "fixup" not in text:
-                by_client[cu].append(cd)
-    for cu in sched:
-        sched[cu].sort()
+                done[cu].append((cd, cats or job_services(j, items.get(j.get("uuid"), []))))
 
-    by_month = defaultdict(lambda: defaultdict(list))
-    for cu, ds in by_client.items():
-        for d in ds:
+    by_month = defaultdict(lambda: defaultdict(list))   # (yr, mo) -> customer -> [(d, D, cats)]
+    for cu, svcs in done.items():
+        svcs.sort(key=lambda x: x[0])
+        for i, (d, cats) in enumerate(svcs):
+            if any(cats & c2 and d < add_months(d2, 6) for d2, c2 in svcs[:i] if d2 < d):
+                continue                                # follow-up visit within 6 months
             D = add_months(d, DUE_MONTHS)
-            by_month[(D.year, D.month)][cu].append(D)
+            by_month[(D.year, D.month)][cu].append((d, D, cats))
+
+    def returned(cu, entries, upper):
+        for d, D, cats in entries:
+            lo = D - timedelta(days=RETENTION_GRACE_BEFORE)
+            for sd, sc in sched.get(cu, []):
+                if lo <= sd and (upper is None or sd <= add_months(D, upper)):
+                    return True
+                if add_months(d, 6) <= sd < lo and sc & cats:
+                    return True
+        return False
 
     first_this = today.replace(day=1)
     last_start = add_months(first_this, -1)
@@ -500,15 +559,8 @@ def retention_series(jobs, activities, today):
     while m <= last_start:
         custs = by_month.get((m.year, m.month), {})
         n = len(custs)
-        in_win = ever = 0
-        for cu, Ds in custs.items():
-            D0 = min(Ds)
-            reb = next((s for s in sched.get(cu, []) if s >= D0 - timedelta(days=RETENTION_GRACE_BEFORE)), None)
-            if reb is None:
-                continue
-            ever += 1
-            if reb <= add_months(D0, RETENTION_SETTLE_MONTHS):
-                in_win += 1
+        in_win = sum(returned(cu, e, RETENTION_SETTLE_MONTHS) for cu, e in custs.items())
+        ever = sum(returned(cu, e, None) for cu, e in custs.items())
         lab = m.strftime("%b %Y")
         pct = lambda k: (k / n * 100) if n else 0.0
         if m <= settle_cut:
@@ -611,7 +663,7 @@ def build_html(today, ch_rows, util_retro, util_pro, ret, ret_last, gm, notes):
 <p class='note'>GP = average 6-month sum of booked job value from the lead &times; gross margin. Recent weeks
 are understated until their 6-month window fills in, so compare older weeks with care.</p>
 <p class='note'>Leads come from the leads inbox (repeat enquiries within 30 days merged, first channel gets
-credit). Booked = matched by phone/email to a ServiceM8 customer with a Work Order or Completed job booked
+credit). Booked = matched by phone/email to a ServiceM8 customer with a job put on the calendar (or completed)
 within 30 days. The latest week's throughput can still rise as late bookings land. {notes}</p>
 
 <h2>Tech utilisation</h2>
@@ -629,8 +681,9 @@ Available = 8h per tech per working day. Public holidays and leave are not remov
 {retention_grid(ret['settled'])}
 <h3>Lifetime (ever returned, same cohorts)</h3>
 {retention_grid(ret['lifetime'])}
-<p class='note'>By month the service fell due. Due = completion + 12 months for every customer. Returned = an
-actively-scheduled job dated no earlier than 30 days before due.</p>
+<p class='note'>By month the service fell due. Due = completion + 12 months for every customer. Retained = any new job
+put on the calendar (no need to wait for completion) from 30 days before due, or an early return: the same
+service rebooked 6+ months after the last one. Follow-up visits within 6 months don't start a new cycle.</p>
 """
     return f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{CSS}</style></head><body>{body}</body></html>"
 
@@ -661,7 +714,7 @@ def save_to_onedrive(pdf_path):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def build_report(sm8, leads, inp, today):
     gm = inp["gross_margin"]
-    eps = attach_bookings(build_episodes(leads), contact_index(sm8), booked_jobs_by_company(sm8["job"]))
+    eps = attach_bookings(build_episodes(leads), contact_index(sm8), booked_jobs_by_company(sm8["job"], sm8["jobactivity"]))
 
     this_monday = today - timedelta(days=today.weekday())
     weeks = [(this_monday - timedelta(days=7 * i), this_monday - timedelta(days=7 * i) + timedelta(days=6))
@@ -681,7 +734,7 @@ def build_report(sm8, leads, inp, today):
     last_mon = this_monday - timedelta(days=7)
     util_retro = utilisation(sm8["jobactivity"], working_days(last_mon, end=last_mon + timedelta(days=4)), techs)
     util_pro = utilisation(sm8["jobactivity"], working_days(today + timedelta(days=1), n=HORIZON_DAYS), techs)
-    ret, ret_last = retention_series(sm8["job"], sm8["jobactivity"], today)
+    ret, ret_last = retention_series(sm8["job"], sm8["jobactivity"], sm8.get("jobmaterial", []), today)
 
     recent = [e for e in eps if e["channel"] in ("Facebook", "Google") and e["start"] >= weeks[0][0]]
     unmatched = sum(1 for e in recent if not e["matched"])
@@ -697,7 +750,7 @@ def check_leads(sm8, leads, today):
     for j in sm8["job"]:
         if j.get("company_uuid"):
             jobs[j["company_uuid"]].append(j)
-    eps = attach_bookings(build_episodes(leads), idx, booked_jobs_by_company(sm8["job"]))
+    eps = attach_bookings(build_episodes(leads), idx, booked_jobs_by_company(sm8["job"], sm8["jobactivity"]))
     recent = [e for e in eps if e["channel"] == "Facebook" and e["start"] >= today - timedelta(days=60)
               and not e["booked"]]
     unmatched = [e for e in recent if not e["matched"]]

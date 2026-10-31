@@ -153,13 +153,18 @@ def _split_names(raw):
     return [n.strip() for n in raw.split(",") if n.strip()]
 
 
+def week_start(today):
+    """Weeks run Saturday to Friday. Start of the week containing `today`."""
+    return today - timedelta(days=(today.weekday() - 5) % 7)
+
+
 def last_complete_month(today):
     end = today.replace(day=1) - timedelta(days=1)
     return end.replace(day=1), end
 
 
 def prompt_inputs(inp, staff_names, today):
-    last_mon = today - timedelta(days=today.weekday() + 7)
+    last_mon = week_start(today) - timedelta(days=7)          # Saturday that started last week
     print(f"\n--- Inputs ---")
     print(f"Last week ({last_mon:%d %b} - {last_mon + timedelta(days=6):%d %b}):")
     inp["fb_cpl"]       = _ask_number("  Facebook CPL", inp.get("fb_cpl"))
@@ -755,7 +760,7 @@ def build_report(sm8, leads, inp, today):
     gm = inp["gross_margin"]
     eps = attach_bookings(build_episodes(leads), contact_index(sm8), booked_jobs_by_company(sm8["job"], sm8["jobactivity"]))
 
-    this_monday = today - timedelta(days=today.weekday())
+    this_monday = week_start(today)                           # this week's Saturday
     weeks = [(this_monday - timedelta(days=7 * i), this_monday - timedelta(days=7 * i) + timedelta(days=6))
              for i in range(WEEKS_SHOWN, 0, -1)]
     hist = inp.get("cpl_history", {})
@@ -779,7 +784,7 @@ def build_report(sm8, leads, inp, today):
 
     techs = resolve_techs(inp["techs"], sm8["staff"])
     last_mon = this_monday - timedelta(days=7)
-    util_retro = utilisation(sm8["jobactivity"], working_days(last_mon, end=last_mon + timedelta(days=4)), techs)
+    util_retro = utilisation(sm8["jobactivity"], working_days(last_mon, end=last_mon + timedelta(days=6)), techs)
     util_pro = utilisation(sm8["jobactivity"], working_days(today + timedelta(days=1), n=HORIZON_DAYS), techs)
     ret, ret_last = retention_series(sm8["job"], sm8["jobactivity"], sm8.get("jobmaterial", []), today)
 
@@ -832,7 +837,7 @@ def check_sales(sm8, leads, today):
     njobs = defaultdict(int)
     for j in sm8["job"]:
         njobs[j.get("company_uuid")] += 1
-    this_monday = today - timedelta(days=today.weekday())
+    this_monday = week_start(today)
     for i in range(6, 0, -1):
         ws = this_monday - timedelta(days=7 * i)
         pool = [e for e in eps if e["channel"] == "Facebook" and ws <= e["start"] <= ws + timedelta(days=6)
